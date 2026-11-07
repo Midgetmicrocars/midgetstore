@@ -1,0 +1,349 @@
+import express from 'express'
+import Stripe from 'stripe'
+import dotenv from 'dotenv'
+
+dotenv.config()
+
+const router = express.Router()
+
+// Initialize Stripe with live secret key from .env
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY || ''
+const stripe = new Stripe(stripeSecretKey, {
+  apiVersion: '2023-10-16' as any
+})
+
+// Helper to get PayPal Access Token (auto-adapting between live and sandbox)
+async function getPayPalAccessToken(): Promise<{ token: string; baseUrl: string }> {
+  const clientId = process.env.PAYPAL_CLIENT_ID || ''
+  const secret = process.env.PAYPAL_CLIENT_SECRET || ''
+
+  if (!clientId || !secret) {
+    throw new Error('PayPal Client ID or Secret is missing in environment variables.')
+  }
+
+  const preferredMode = process.env.PAYPAL_MODE === 'live' ? 'live' : 'sandbox'
+  const primaryBase = preferredMode === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com'
+  const fallbackBase = preferredMode === 'live' ? 'https://api-m.sandbox.paypal.com' : 'https://api-m.paypal.com'
+
+  const auth = Buffer.from(`${clientId}:${secret}`).toString('base64')
+
+  try {
+    const res = await fetch(`${primaryBase}/v1/oauth2/token`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: 'grant_type=client_credentials'
+    })
+    const data = await res.json()
+    if (res.ok && data.access_token) {
+      return { token: data.access_token, baseUrl: primaryBase }
+    }
+  } catch (e) {
+    console.warn('Primary PayPal endpoint failed, attempting fallback endpoint...')
+  }
+
+  // Fallback endpoint in case credentials correspond to sandbox mode
+  const resFallback = await fetch(`${fallbackBase}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'grant_type=client_credentials'
+  })
+  const dataFallback = await resFallback.json()
+  if (resFallback.ok && dataFallback.access_token) {
+    return { token: dataFallback.access_token, baseUrl: fallbackBase }
+  }
+
+  throw new Error(`Failed to authenticate with PayPal: ${dataFallback.error_description || dataFallback.error || 'Unknown error'}`)
+}
+
+// ==========================================
+// 1. STRIPE PAYMENT INTEGRATION (USD)
+// ==========================================
+
+// Get Stripe Public Configuration for Frontend Elements
+router.get('/stripe/config', (req, res) => {
+  const publishableKey =
+    process.env.STRIPE_PUBLISHABLE_KEY ||
+    process.env.VITE_STRIPE_PUBLISHABLE_KEY ||
+    'pk_live_51U1OVJAZusdAC7Xt4oUvFKuo36Qv6bYLXClwuWTzykMfDGJm29pZJPTSU98hS4R13id0KB0BFRp8sjHTcCClExjh00TOV3ZXSq'
+  res.status(200).json({
+    success: true,
+    data: {
+      publishableKey,
+      currency: 'USD'
+    }
+  })
+})
+
+// Create Payment Intent for Stripe Elements & Card Checkout
+router.post('/stripe/create-intent', async (req, res) => {
+  try {
+    const { amount } = req.body
+
+    if (!amount || Number(amount) <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Valid USD amount is required'
+      })
+    }
+
+    const amountInCents = Math.round(Number(amount) * 100)
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amountInCents,
+      currency: 'usd',
+      automatic_payment_methods: {
+        enabled: true
+      },
+      description: 'Midget Micro Drive & Rides - E-Commerce Purchase',
+      metadata: {
+        company: 'Midget Micro Drive & Rides',
+        head_office: 'Austin, Texas, USA'
+      }
+    })
+
+    res.status(200).json({
+      success: true,
+      data: {
+        clientSecret: paymentIntent.client_secret,
+        paymentIntentId: paymentIntent.id
+      }
+    })
+  } catch (error: any) {
+    console.error('Stripe create-intent error:', error)
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to create Stripe payment intent'
+    })
+  }
+})
+
+// Confirm / Check status of Stripe payment
+router.post('/stripe/confirm', async (req, res) => {
+  try {
+    const { paymentIntentId } = req.body
+
+    if (!paymentIntentId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Payment intent ID is required'
+      })
+    }
+
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId)
+
+    res.status(200).json({
+      success: true,
+      data: {
+        status: paymentIntent.status,
+        paymentId: paymentIntent.id,
+        amount: paymentIntent.amount / 100,
+        currency: paymentIntent.currency
+      }
+    })
+  } catch (error: any) {
+    console.error('Stripe confirm error:', error)
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to confirm Stripe payment'
+    })
+  }
+})
+
+// ==========================================
+// 2. PAYPAL PAYMENT INTEGRATION (USD)
+// ==========================================
+
+// Get PayPal Public Configuration for Frontend SDK (auto-detecting verified mode)
+router.get('/paypal/config', async (_req, res) => {
+  const clientId = process.env.PAYPAL_CLIENT_ID || process.env.VITE_PAYPAL_CLIENT_ID || ''
+  const merchantId = process.env.PAYPAL_MERCHANT_ID || 'N7YM95SPUR8P8'
+  let mode = process.env.PAYPAL_MODE || 'live'
+  let sdkUrl = mode === 'sandbox' ? 'https://www.sandbox.paypal.com/sdk/js' : 'https://www.paypal.com/sdk/js'
+
+  try {
+    const { baseUrl } = await getPayPalAccessToken()
+    if (baseUrl.includes('sandbox')) {
+      mode = 'sandbox'
+      sdkUrl = 'https://www.sandbox.paypal.com/sdk/js'
+    } else {
+      mode = 'live'
+      sdkUrl = 'https://www.paypal.com/sdk/js'
+    }
+  } catch (err) {
+    // Keep environment default
+  }
+
+  res.status(200).json({
+    success: true,
+    data: {
+      clientId,
+      merchantId,
+      mode,
+      sdkUrl,
+      currency: 'USD'
+    }
+  })
+})
+
+// Create PayPal Order
+router.post('/paypal/create-order', async (req, res) => {
+  try {
+    const { amount, payer } = req.body
+
+    if (!amount || Number(amount) <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Valid USD amount is required'
+      })
+    }
+
+    const { token, baseUrl } = await getPayPalAccessToken()
+    const formattedAmount = Number(amount).toFixed(2)
+    const merchantId = process.env.PAYPAL_MERCHANT_ID || 'N7YM95SPUR8P8'
+
+    let cleanOrigin = 'https://midgetmicrodrivesandrides.shop'
+    try {
+      const headerOrigin = (req.headers.origin as string) || (req.headers.referer as string)
+      if (headerOrigin) {
+        const parsed = new URL(headerOrigin)
+        cleanOrigin = `${parsed.protocol}//${parsed.host}`
+      }
+    } catch {
+      cleanOrigin = 'https://midgetmicrodrivesandrides.shop'
+    }
+
+    const payload: any = {
+      intent: 'CAPTURE',
+      purchase_units: [
+        {
+          reference_id: `MMR-${Date.now()}`,
+          description: 'Midget Micro Drive & Rides Store Order',
+          amount: {
+            currency_code: 'USD',
+            value: formattedAmount
+          },
+          ...(merchantId ? { payee: { merchant_id: merchantId } } : {})
+        }
+      ],
+      application_context: {
+        brand_name: 'Midget Micro Drive & Rides',
+        landing_page: 'NO_PREFERENCE',
+        shipping_preference: 'NO_SHIPPING',
+        user_action: 'PAY_NOW',
+        return_url: `${cleanOrigin}/order-success`,
+        cancel_url: `${cleanOrigin}/checkout`
+      }
+    }
+
+    // Safely attach payer details only if syntactically valid per PayPal v2 schema
+    if (payer && typeof payer === 'object') {
+      const email = typeof payer.email === 'string' && payer.email.includes('@') ? payer.email.trim() : null
+      const firstName = typeof payer.firstName === 'string' && payer.firstName.trim().length > 0 ? payer.firstName.trim().substring(0, 140) : null
+      const lastName = typeof payer.lastName === 'string' && payer.lastName.trim().length > 0 ? payer.lastName.trim().substring(0, 140) : null
+
+      if (email || firstName || lastName) {
+        const payerObj: any = {}
+        if (email) payerObj.email_address = email
+        if (firstName || lastName) {
+          payerObj.name = {}
+          if (firstName) payerObj.name.given_name = firstName
+          if (lastName) payerObj.name.surname = lastName
+        }
+        payload.payer = payerObj
+      }
+    }
+
+    const orderRes = await fetch(`${baseUrl}/v2/checkout/orders`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    })
+
+    const orderData = await orderRes.json()
+
+    if (!orderRes.ok) {
+      console.error('PayPal create-order API error response:', JSON.stringify(orderData, null, 2))
+      const details = Array.isArray(orderData.details)
+        ? orderData.details.map((d: any) => `${d.field ? d.field + ': ' : ''}${d.description || d.issue}`).join('; ')
+        : ''
+      throw new Error(details ? `${orderData.message} (${details})` : (orderData.message || 'Failed to create PayPal order'))
+    }
+
+    const approveLink = orderData.links?.find((l: any) => l.rel === 'approve')?.href || ''
+
+    res.status(200).json({
+      success: true,
+      data: {
+        orderId: orderData.id,
+        approveUrl: approveLink,
+        status: orderData.status
+      }
+    })
+  } catch (error: any) {
+    console.error('PayPal create-order error:', error)
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to create PayPal order'
+    })
+  }
+})
+
+// Capture PayPal Order
+router.post('/paypal/capture', async (req, res) => {
+  try {
+    const orderId = req.body.orderId || req.body.orderID
+
+    if (!orderId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Order ID is required'
+      })
+    }
+
+    const { token, baseUrl } = await getPayPalAccessToken()
+
+    const captureRes = await fetch(`${baseUrl}/v2/checkout/orders/${orderId}/capture`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      }
+    })
+
+    const captureData = await captureRes.json()
+
+    if (!captureRes.ok) {
+      console.error('PayPal capture API error response:', JSON.stringify(captureData, null, 2))
+      const details = Array.isArray(captureData.details)
+        ? captureData.details.map((d: any) => `${d.field ? d.field + ': ' : ''}${d.description || d.issue}`).join('; ')
+        : ''
+      throw new Error(details ? `${captureData.message} (${details})` : (captureData.message || 'Failed to capture PayPal payment'))
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        status: captureData.status || 'COMPLETED',
+        paymentId: captureData.id,
+        payer: captureData.payer
+      }
+    })
+  } catch (error: any) {
+    console.error('PayPal capture error:', error)
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to capture PayPal payment'
+    })
+  }
+})
+
+export default router

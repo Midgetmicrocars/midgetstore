@@ -1,0 +1,272 @@
+import express from 'express'
+import cors from 'cors'
+import helmet from 'helmet'
+import morgan from 'morgan'
+import dotenv from 'dotenv'
+import cookieParser from 'cookie-parser'
+import path from 'path'
+import fs from 'fs'
+import { fileURLToPath } from 'url'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+// Import database connection
+import { supabase } from './utils/supabase.js'
+
+// Import routes
+import productRoutes from './routes/products.js'
+import orderRoutes from './routes/orders.js'
+import authRoutes from './routes/auth.js'
+import adminRoutes from './routes/admin.js'
+import eventsRoutes from './routes/events.js'
+import paymentRoutes from './routes/payments.js'
+import cartRoutes from './routes/cart.js'
+import storesRoutes from './routes/stores.js'
+import { databaseService } from './services/databaseService.js'
+import { emailService } from './utils/emailService.js'
+
+// Import middleware
+import { errorHandler } from './middleware/errorHandler.js'
+import { notFound } from './middleware/notFound.js'
+
+// Load environment variables
+dotenv.config()
+
+const app = express()
+const PORT = process.env.PORT || process.env.BACKEND_PORT || 5000
+
+// Security middleware - disable restrictive CSP so client assets load seamlessly
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false
+}))
+
+// CORS configuration supporting development and production shop domains
+const allowedOrigins = [
+  process.env.CLIENT_URL,
+  process.env.PRODUCTION_url,
+  'https://midgetdriftcarsandebikes.shop',
+  'http://midgetdriftcarsandebikes.shop',
+  'https://midgetmicrodrives.shop',
+  'http://midgetmicrodrives.shop',
+  'https://midgetmicrodrivesandrides.shop',
+  'http://midgetmicrodrivesandrides.shop',
+  'http://localhost:3000',
+  'http://localhost:5000',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:5000'
+].filter(Boolean) as string[]
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow server-to-server, curl, mobile, or requests with no origin
+    if (!origin) return callback(null, true)
+    if (
+      allowedOrigins.includes(origin) ||
+      origin.endsWith('.midgetdriftcarsandebikes.shop') ||
+      origin.endsWith('.midgetmicrodrives.shop') ||
+      origin.endsWith('.midgetmicrodrivesandrides.shop')
+    ) {
+      return callback(null, true)
+    }
+    // Allow dynamic origins in production
+    return callback(null, true)
+  },
+  credentials: true
+}))
+
+// Body parsing middleware (supporting larger media metadata and payload buffers)
+app.use(express.json({ limit: '100mb' }))
+app.use(express.urlencoded({ extended: true, limit: '100mb' }))
+app.use(cookieParser())
+
+// Logging middleware
+app.use(morgan('combined'))
+
+// Paths for static assets
+const clientPublicPath = path.resolve(__dirname, '../../client/public')
+const distPath = path.resolve(__dirname, '../../dist')
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'OK',
+    message: 'Midget Micro Drive & Rides API is running',
+    currency: 'USD',
+    headOffice: 'Texas, USA',
+    timestamp: new Date().toISOString()
+  })
+})
+
+// API documentation / status endpoint
+app.get('/api', (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: 'Midget Micro Drive & Rides API Server - small rides, big excitement',
+    version: '1.0.0',
+    headOffice: 'Austin, Texas, United States',
+    currency: 'USD',
+    endpoints: {
+      health: '/health',
+      products: '/api/products',
+      auth: '/api/auth',
+      cart: '/api/cart',
+      orders: '/api/orders',
+      payments: '/api/payments'
+    },
+    timestamp: new Date().toISOString()
+  })
+})
+
+// ==========================================
+// API Routes (Mounted FIRST so /api is never handled by static file server)
+// ==========================================
+app.use('/api/products', productRoutes)
+app.use('/api/orders', orderRoutes)
+app.use('/api/auth', authRoutes)
+app.use('/api/admin', adminRoutes)
+app.use('/api/events', eventsRoutes)
+app.use('/api/payments', paymentRoutes)
+app.use('/api/cart', cartRoutes)
+app.use('/api/stores', storesRoutes)
+
+// ==========================================
+// Static File Serving (Excludes /api and /health)
+// ==========================================
+
+// Product images & media
+app.use('/images', express.static(path.join(clientPublicPath, 'images'), {
+  maxAge: '1d',
+  fallthrough: true
+}))
+
+if (fs.existsSync(path.join(distPath, 'images'))) {
+  app.use('/images', express.static(path.join(distPath, 'images'), {
+    maxAge: '1d',
+    fallthrough: true
+  }))
+}
+
+// Serve Vite production build static assets (JS, CSS, fonts) for non-API requests
+if (fs.existsSync(distPath)) {
+  app.use((req, res, next) => {
+    if (req.path.startsWith('/api') || req.path.startsWith('/health')) {
+      return next()
+    }
+    express.static(distPath, {
+      maxAge: '1d',
+      index: false,
+      fallthrough: true
+    })(req, res, next)
+  })
+}
+
+// Also serve client public folder for non-API requests
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/health')) {
+    return next()
+  }
+  express.static(clientPublicPath, {
+    maxAge: '1d',
+    fallthrough: true
+  })(req, res, next)
+})
+
+// Serve favicon.ico
+app.get('/favicon.ico', (req, res) => {
+  const faviconDist = path.join(distPath, 'favicon.ico')
+  const faviconPublic = path.join(clientPublicPath, 'favicon.ico')
+  if (fs.existsSync(faviconDist)) return res.sendFile(faviconDist)
+  if (fs.existsSync(faviconPublic)) return res.sendFile(faviconPublic)
+  res.status(204).end()
+})
+
+// SPA Fallback: Any non-API GET request serves dist/index.html
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api') || req.path.startsWith('/health') || req.path.startsWith('/images')) {
+    return next()
+  }
+  const indexPath = path.join(distPath, 'index.html')
+  if (fs.existsSync(indexPath)) {
+    return res.sendFile(indexPath)
+  }
+  res.status(200).json({
+    success: true,
+    message: 'Midget Micro Drive & Rides API Server - small rides, big excitement',
+    status: 'API running. Run `npm run build` to build and serve client frontend bundle.',
+    timestamp: new Date().toISOString()
+  })
+})
+
+// Error handling middleware
+app.use(notFound)
+app.use(errorHandler)
+
+// Database connection check
+async function connectDatabase() {
+  try {
+    const { error: supabaseError } = await supabase.from('products').select('id').limit(1)
+    if (supabaseError) {
+      console.warn('⚠️  Supabase JS client notice:', supabaseError.message)
+    } else {
+      console.log('✅ Supabase JavaScript Client connected successfully')
+    }
+  } catch (error) {
+    console.error('⚠️  Database connection warning:', error instanceof Error ? error.message : error)
+  }
+}
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('🛑 Shutting down server...')
+  process.exit(0)
+})
+
+process.on('SIGTERM', () => {
+  console.log('🛑 Shutting down server...')
+  process.exit(0)
+})
+
+// Background checker for pending orders with over 30 minutes incomplete pay
+function initPendingOrdersChecker() {
+  const checkPendingOrders = async () => {
+    try {
+      const pendingOrders = await databaseService.findPendingOrdersOver30Minutes()
+      if (pendingOrders && pendingOrders.length > 0) {
+        console.log(`⏰ Found ${pendingOrders.length} order(s) pending > 30 minutes. Dispatching payment reminders...`)
+        for (const order of pendingOrders) {
+          try {
+            await emailService.sendPendingOrderPaymentReminder(order)
+            await databaseService.markPendingReminderSent(order.id)
+            console.log(`✅ 30-min pending payment reminder dispatched for order #${order.orderNumber}`)
+          } catch (orderErr) {
+            console.error(`Error sending pending reminder for order ${order.id}:`, orderErr)
+          }
+        }
+      }
+    } catch (err: any) {
+      console.warn('Pending order reminder routine check notice:', err.message)
+    }
+  }
+
+  // Check on startup after 10 seconds, then periodically every 5 minutes
+  setTimeout(checkPendingOrders, 10000)
+  setInterval(checkPendingOrders, 5 * 60 * 1000)
+}
+
+// Start server
+async function startServer() {
+  await connectDatabase()
+  initPendingOrdersChecker()
+
+  app.listen(PORT, () => {
+    console.log(`🚀 Midget Micro Drive & Rides server is running on port ${PORT}`)
+    console.log(`📱 Client URL: ${process.env.CLIENT_URL || 'http://localhost:3000'}`)
+    console.log(`🗄️  Database: Connected to Supabase PostgreSQL (USD Store Catalog)`)
+  })
+}
+
+startServer()
+
+export default app
